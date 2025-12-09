@@ -49,6 +49,10 @@ public class Runner {
   private final LongAdder totalUpdated = new LongAdder();
   private final LongAdder totalErrors = new LongAdder();
 
+  // Timing
+  private Instant insertStartTime;
+  private Instant insertEndTime;
+
   public Runner(
       String connectionString,
       int threadsCount,
@@ -99,8 +103,8 @@ public class Runner {
     // Phase 1: Insert phase
     System.out.println("\n=== Phase 1: INSERT ===");
     System.out.printf("Spawning %d threads...%n", threadsCount);
-    Instant insertStartTime = Instant.now();
-    Instant insertEndTime = insertStartTime.plus(Duration.ofMinutes(durationMinutes));
+    this.insertStartTime = Instant.now();
+    this.insertEndTime = insertStartTime.plus(Duration.ofMinutes(durationMinutes));
 
     for (int i = 0; i < this.threadsCount; i++) {
       final int workerId = i;
@@ -137,7 +141,7 @@ public class Runner {
       System.err.println("Interrupted during join");
     } finally {
       printFinalSummary();
-      cleanupAfterTest();
+      // cleanupAfterTest();
       shutdown();
     }
   }
@@ -231,15 +235,34 @@ public class Runner {
   private void performBulkUpdate() {
     try {
       MongoDatabase db = mongoClient.getDatabase(dbName);
-      System.out.println("Starting bulk update of all documents...");
+      long totalDocs = totalInserted.sum();
+      System.out.printf("Starting bulk update of %,d documents...%n", totalDocs);
+      System.out.println("(This may take several minutes with Atlas Search index enabled)");
 
       long startTime = System.currentTimeMillis();
 
-      // Create update document with large payload similar to the JS script
+      // Create update document with 2 KB document
       Document updateDoc = new Document("$set",
-          new Document("value2", "bar".repeat(10 * 1024))
+          new Document("value2", "bar".repeat(10 * 682))
               .append("lastUpdated", new java.util.Date())
       );
+
+      // Start a progress monitor thread
+      Thread progressMonitor = new Thread(() -> {
+        try {
+          int dots = 0;
+          while (!Thread.currentThread().isInterrupted()) {
+            Thread.sleep(5000); // Print every 5 seconds
+            dots++;
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            System.out.printf("Update in progress... (%d seconds elapsed)%n", elapsed);
+          }
+        } catch (InterruptedException e) {
+          // Expected when update completes
+        }
+      });
+      progressMonitor.setDaemon(true);
+      progressMonitor.start();
 
       // Update all documents in the collection
       var result = db.getCollection(collectionName).updateMany(
@@ -247,12 +270,15 @@ public class Runner {
           updateDoc
       );
 
+      // Stop progress monitor
+      progressMonitor.interrupt();
+
       long endTime = System.currentTimeMillis();
       double durationSeconds = (endTime - startTime) / 1000.0;
 
       totalUpdated.add(result.getModifiedCount());
 
-      System.out.printf("Bulk update completed: %d documents updated in %.1f seconds (%.0f docs/sec)%n",
+      System.out.printf("Bulk update completed: %,d documents updated in %.1f seconds (%.0f docs/sec)%n",
           result.getModifiedCount(), durationSeconds, result.getModifiedCount() / durationSeconds);
 
     } catch (Exception e) {
@@ -267,8 +293,10 @@ public class Runner {
     System.out.printf("Total Docs Inserted: %,d%n", totalInserted.sum());
     System.out.printf("Total Errors:        %,d%n", totalErrors.sum());
 
-    double totalSeconds = durationMinutes * 60.0;
+    // Calculate actual elapsed time, not configured duration
+    double totalSeconds = Duration.between(insertStartTime, Instant.now()).toMillis() / 1000.0;
     double throughput = totalInserted.sum() / totalSeconds;
+    System.out.printf("Duration:            %.1f seconds%n", totalSeconds);
     System.out.printf("Avg Throughput:      %.2f docs/sec%n", throughput);
     System.out.println("==============================");
   }
@@ -364,8 +392,8 @@ public class Runner {
       this.docsPerIteration = docsPerIteration;
       this.useStringIds = useStringIds;
       this.workerId = workerId;
-      // Generate large payloads similar to JS script: "foo".repeat(10 * 1024) = 30KB
-      this.payloads = generatePayloads(100, 10 * 1024);
+      // Generate 2 KB documents.
+      this.payloads = generatePayloads(100, 682);
       this.docs = new ArrayList<>();
     }
 
