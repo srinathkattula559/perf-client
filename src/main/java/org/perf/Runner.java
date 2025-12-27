@@ -243,7 +243,7 @@ public class Runner {
 
       // Create update document with 2 KB document
       Document updateDoc = new Document("$set",
-          new Document("value2", "bar".repeat(10 * 682))
+          new Document("value2", "bar".repeat(682))
               .append("lastUpdated", new java.util.Date())
       );
 

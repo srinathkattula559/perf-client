@@ -2,19 +2,8 @@ package org.perf;
 
 public class Main {
     public static void main(String[] args) {
-        if (args.length < 8) {
-            printUsage();
-            System.exit(1);
-        }
         try {
             String connectionString = args[0];
-            int threadsCount = Integer.parseInt(args[1]);
-            int durationMinutes = Integer.parseInt(args[2]);
-            long batchWaitMillis = Long.parseLong(args[3]);
-            int docsPerIteration = Integer.parseInt(args[4]);
-            String collectionName = args[5];
-            boolean useStringIds = Boolean.parseBoolean(args[6]);
-            boolean enableUpdatePhase = Boolean.parseBoolean(args[7]);
 
             String maskedConnString = connectionString.length() > 20
                     ? connectionString.substring(0, 15) + "..."
@@ -22,36 +11,14 @@ public class Main {
 
             System.out.printf(
                     "Starting Perf Client:\n" +
-                            " - Connection string: %s\n" +
-                            " - Threads count: %d\n" +
-                            " - Duration: %d minutes\n" +
-                            " - Batch wait: %d millis\n" +
-                            " - Docs per iteration: %d\n" +
-                            " - Collection name: %s\n" +
-                            " - Use random string IDs: %b\n" +
-                            " - Enable update phase: %b\n",
-                    maskedConnString,
-                    threadsCount,
-                    durationMinutes,
-                    batchWaitMillis,
-                    docsPerIteration,
-                    collectionName,
-                    useStringIds,
-                    enableUpdatePhase);
+                            " - Connection string: %s\n" ,
+                    maskedConnString);
 
-            final var runner = new Runner(
-                    connectionString,
-                    threadsCount,
-                    durationMinutes,
-                    batchWaitMillis,
-                    docsPerIteration,
-                    collectionName,
-                    useStringIds,
-                    enableUpdatePhase
+            final var runner = new ManyIndexesScenario(
+                    connectionString
             );
 
-            runner.start();
-            runner.waitAndJoin();
+            runner.run();
 
         } catch (NumberFormatException e) {
             System.err.println("Error parsing arguments. Ensure numeric values are correct.");
