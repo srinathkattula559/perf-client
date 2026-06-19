@@ -177,22 +177,17 @@ public class Runner {
   }
 
   private void cleanupBeforeTest() {
-    System.out.println("\nCleaning up existing search indexes and collections...");
+    System.out.println("\nCleaning up all existing search indexes and collections...");
     MongoDatabase db = mongoClient.getDatabase(dbName);
 
-    dropAllSearchIndexes(db.getCollection(collectionName));
-
-    // Drop collection
-    try {
-      db.getCollection(collectionName).drop();
-      System.out.println("Dropped existing collection");
-    } catch (Exception e) {
-      System.out.printf("Collection does not exist: %s%n", e.getMessage());
-    }
+    dropAllSearchIndexes(db);
+    dropAllCollections(db);
   }
 
-  private void dropAllSearchIndexes(MongoCollection<Document> collection) {
-    try {
+  private void dropAllSearchIndexes(MongoDatabase db) {
+    int droppedCount = 0;
+    for (String existingCollectionName : db.listCollectionNames()) {
+      MongoCollection<Document> collection = db.getCollection(existingCollectionName);
       List<String> indexNames = new ArrayList<>();
       for (Document index : collection.listSearchIndexes()) {
         String name = index.getString("name");
@@ -201,17 +196,34 @@ public class Runner {
         }
       }
 
-      if (indexNames.isEmpty()) {
-        System.out.println("No existing search indexes found");
-        return;
-      }
-
       for (String indexName : indexNames) {
         collection.dropSearchIndex(indexName);
-        System.out.printf("Dropped search index: %s%n", indexName);
+        droppedCount++;
+        System.out.printf("Dropped search index: %s.%s%n", existingCollectionName, indexName);
       }
-    } catch (Exception e) {
-      System.out.printf("Could not list or drop search indexes: %s%n", e.getMessage());
+    }
+
+    if (droppedCount == 0) {
+      System.out.println("No existing search indexes found in database");
+    }
+  }
+
+  private void dropAllCollections(MongoDatabase db) {
+    List<String> collectionNames = new ArrayList<>();
+    for (String existingCollectionName : db.listCollectionNames()) {
+      if (!existingCollectionName.startsWith("system.")) {
+        collectionNames.add(existingCollectionName);
+      }
+    }
+
+    if (collectionNames.isEmpty()) {
+      System.out.println("No existing collections found in database");
+      return;
+    }
+
+    for (String existingCollectionName : collectionNames) {
+      db.getCollection(existingCollectionName).drop();
+      System.out.printf("Dropped collection: %s%n", existingCollectionName);
     }
   }
 

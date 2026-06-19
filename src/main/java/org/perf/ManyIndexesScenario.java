@@ -122,6 +122,9 @@ public class ManyIndexesScenario {
   }
 
   private void setupEnvironment() {
+    dropAllSearchIndexesInDatabase();
+    dropAllCollectionsInDatabase();
+
     System.out.println("\n>>> Setting up " + totalCollections + " collections...");
     ExecutorService setupPool = Executors.newFixedThreadPool(50);
     List<Future<?>> setupTasks = new ArrayList<>();
@@ -132,7 +135,6 @@ public class ManyIndexesScenario {
       setupTasks.add(setupPool.submit(() -> {
         String collName = BASE_COLL_NAME + indexId;
         ensureCollection(collName);
-        dropAllSearchIndexes(collName);
         db.getCollection(collName).createIndex(Indexes.compoundIndex(
             Indexes.ascending("status"),
             Indexes.ascending("batchId")));
@@ -232,15 +234,8 @@ public class ManyIndexesScenario {
   }
 
   private void cleanupEnvironment() {
-    System.out.println("\n>>> Cleaning up scale test collections...");
-    for (int i = 0; i < totalCollections; i++) {
-      String collName = BASE_COLL_NAME + i;
-      try {
-        db.getCollection(collName).drop();
-      } catch (Exception e) {
-        System.err.printf("Failed to drop %s: %s%n", collName, e.getMessage());
-      }
-    }
+    System.out.println("\n>>> Cleaning up all collections in database...");
+    dropAllCollectionsInDatabase();
   }
 
   private void ensureCollection(String collName) {
@@ -258,18 +253,47 @@ public class ManyIndexesScenario {
     collection.createSearchIndex(SEARCH_INDEX_NAME, definition);
   }
 
-  private void dropAllSearchIndexes(String collName) {
-    MongoCollection<Document> collection = db.getCollection(collName);
-    List<String> indexNames = new ArrayList<>();
-    for (Document index : collection.listSearchIndexes()) {
-      String name = index.getString("name");
-      if (name != null && !name.isBlank()) {
-        indexNames.add(name);
+  private void dropAllSearchIndexesInDatabase() {
+    System.out.println("\n>>> Dropping all existing search indexes in database...");
+    int droppedCount = 0;
+    for (String collName : db.listCollectionNames()) {
+      MongoCollection<Document> collection = db.getCollection(collName);
+      List<String> indexNames = new ArrayList<>();
+      for (Document index : collection.listSearchIndexes()) {
+        String name = index.getString("name");
+        if (name != null && !name.isBlank()) {
+          indexNames.add(name);
+        }
+      }
+
+      for (String indexName : indexNames) {
+        collection.dropSearchIndex(indexName);
+        droppedCount++;
+        System.out.printf("Dropped search index: %s.%s%n", collName, indexName);
       }
     }
 
-    for (String indexName : indexNames) {
-      collection.dropSearchIndex(indexName);
+    if (droppedCount == 0) {
+      System.out.println("No existing search indexes found in database");
+    }
+  }
+
+  private void dropAllCollectionsInDatabase() {
+    List<String> collectionNames = new ArrayList<>();
+    for (String collName : db.listCollectionNames()) {
+      if (!collName.startsWith("system.")) {
+        collectionNames.add(collName);
+      }
+    }
+
+    if (collectionNames.isEmpty()) {
+      System.out.println("No existing collections found in database");
+      return;
+    }
+
+    for (String collName : collectionNames) {
+      db.getCollection(collName).drop();
+      System.out.printf("Dropped collection: %s%n", collName);
     }
   }
 

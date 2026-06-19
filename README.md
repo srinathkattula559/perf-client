@@ -66,16 +66,16 @@ java -jar target/perf-client.jar \
 
 ## What it does
 
-1. **Cleanup**: Drops all existing Atlas Search indexes on the target collection, then drops the collection
+1. **Cleanup**: Drops all existing Atlas Search indexes and non-system collections in the database
 2. **Setup**: Creates collection and Atlas Search index (dynamic mapping)
 3. **Wait**: Polls until the Atlas Search index is ready
 4. **Phase 1 - Insert**: Multi-threaded inserts (30KB docs) for specified duration
 5. **Phase 2 - Update** (optional): Bulk updates all docs, adding `value2` (~30KB) and `lastUpdated`
 6. **Preserve results**: Leaves the collection and Search index in place for inspection
 
-Each run still starts by clearing all Search indexes and dropping the target collection,
-so the workload begins from a clean state. Dropping the collection also removes any
-regular MongoDB indexes on that collection.
+Each run still starts by clearing all Atlas Search indexes and non-system collections in
+the selected database, so the workload begins from a clean state. Dropping collections
+also removes their regular MongoDB indexes.
 
 ## Many-index scale scenario
 
@@ -103,10 +103,10 @@ java \
   "mongodb+srv://user:pass@cluster.mongodb.net/testdb"
 ```
 
-This scenario creates `scale_test_*` collections in the database from the connection
-string, waits for all Search indexes to become queryable, and updates only the batch each
-worker just inserted. It drops the scale-test collections at the end by default; set
-`-DcleanupAfterRun=false` when you need to inspect the data after a run.
+This scenario clears the selected database, creates `scale_test_*` collections, waits for
+all Search indexes to become queryable, and updates only the batch each worker just
+inserted. It drops all non-system collections in the selected database at the end by
+default; set `-DcleanupAfterRun=false` when you need to inspect the data after a run.
 
 ## Requirements
 
