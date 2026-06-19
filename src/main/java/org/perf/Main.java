@@ -134,11 +134,11 @@ public class Main {
 
   private static void printUsage() {
     System.err.println(
-        "Usage: java -jar target/perf-client-1.0-SNAPSHOT.jar "
+        "Usage: java -jar target/perf-client.jar "
             + "<connStr> <threads> <duration> <batchWait> <docsPerIter> "
             + "<collection> <useStringIds> <enableUpdatePhase>");
     System.err.println(
-        "Example: java -jar target/perf-client-1.0-SNAPSHOT.jar "
+        "Example: java -jar target/perf-client.jar "
             + "\"mongodb+srv://user:pass@cluster.mongodb.net/testdb\" "
             + "10 5 0 100 testColl false true");
   }

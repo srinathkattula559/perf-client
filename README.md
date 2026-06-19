@@ -11,7 +11,7 @@ Multi-threaded Java tool for MongoDB performance testing.
 ## Run
 
 ```bash
-java -jar target/perf-client-1.0-SNAPSHOT.jar \
+java -jar target/perf-client.jar \
   <connStr> <threads> <duration> <batchWait> <docsPerIter> <collection> <useStringIds> <enableUpdatePhase>
 ```
 
@@ -34,7 +34,7 @@ java -jar target/perf-client-1.0-SNAPSHOT.jar \
 
 ### High throughput test (Atlas)
 ```bash
-java -jar target/perf-client-1.0-SNAPSHOT.jar \
+java -jar target/perf-client.jar \
   "mongodb+srv://user:pass@cluster.mongodb.net/testdb" \
   50 \
   5 \
@@ -48,7 +48,7 @@ java -jar target/perf-client-1.0-SNAPSHOT.jar \
 
 ### Insert only (Atlas)
 ```bash
-java -jar target/perf-client-1.0-SNAPSHOT.jar \
+java -jar target/perf-client.jar \
   "mongodb+srv://user:pass@cluster.mongodb.net/testdb" \
   10 \
   5 \
@@ -68,7 +68,7 @@ java -jar target/perf-client-1.0-SNAPSHOT.jar \
 
 1. **Cleanup**: Drops existing search index and collection
 2. **Setup**: Creates collection and Atlas Search index (dynamic mapping)
-3. **Wait**: Waits 60 seconds for index to be ready
+3. **Wait**: Polls until the Atlas Search index is ready
 4. **Phase 1 - Insert**: Multi-threaded inserts (30KB docs) for specified duration
 5. **Phase 2 - Update** (optional): Bulk updates all docs, adding `value2` (~30KB) and `lastUpdated`
 6. **Cleanup**: Drops search index and collection
@@ -80,7 +80,7 @@ available for testing many Atlas Search indexes with writes focused on a smaller
 set:
 
 ```bash
-java -cp target/perf-client-1.0-SNAPSHOT.jar org.perf.ManyIndexesScenario \
+java -cp target/perf-client.jar org.perf.ManyIndexesScenario \
   "mongodb+srv://user:pass@cluster.mongodb.net/testdb"
 ```
 
@@ -94,7 +94,7 @@ java \
   -Dthreads=10 \
   -DdocsPerBatch=5000 \
   -DcleanupAfterRun=true \
-  -cp target/perf-client-1.0-SNAPSHOT.jar \
+  -cp target/perf-client.jar \
   org.perf.ManyIndexesScenario \
   "mongodb+srv://user:pass@cluster.mongodb.net/testdb"
 ```
