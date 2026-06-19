@@ -66,12 +66,16 @@ java -jar target/perf-client.jar \
 
 ## What it does
 
-1. **Cleanup**: Drops existing search index and collection
+1. **Cleanup**: Drops all existing Atlas Search indexes on the target collection, then drops the collection
 2. **Setup**: Creates collection and Atlas Search index (dynamic mapping)
 3. **Wait**: Polls until the Atlas Search index is ready
 4. **Phase 1 - Insert**: Multi-threaded inserts (30KB docs) for specified duration
 5. **Phase 2 - Update** (optional): Bulk updates all docs, adding `value2` (~30KB) and `lastUpdated`
-6. **Cleanup**: Drops search index and collection
+6. **Preserve results**: Leaves the collection and Search index in place for inspection
+
+Each run still starts by clearing all Search indexes and dropping the target collection,
+so the workload begins from a clean state. Dropping the collection also removes any
+regular MongoDB indexes on that collection.
 
 ## Many-index scale scenario
 

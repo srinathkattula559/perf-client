@@ -96,7 +96,7 @@ public class Runner {
         .applyConnectionString(new ConnectionString(this.connectionString))
         .applyToSocketSettings(builder -> builder
             .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS))
+            .readTimeout(0, TimeUnit.MILLISECONDS))
         .applyToConnectionPoolSettings(builder -> builder
             .maxSize(Math.max(100, threadsCount * 2)))
         .build();
@@ -163,9 +163,15 @@ public class Runner {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       System.err.println("Interrupted during join");
+    } catch (RuntimeException e) {
+      totalErrors.add(1);
+      System.err.println("Workload failed: " + e.getMessage());
+      throw e;
     } finally {
       printFinalSummary();
-      cleanupAfterTest();
+      System.out.printf(
+          "Leaving collection '%s' and search index '%s' in place for inspection.%n",
+          collectionName, SEARCH_INDEX_NAME);
       shutdown();
     }
   }
@@ -174,14 +180,7 @@ public class Runner {
     System.out.println("\nCleaning up existing search indexes and collections...");
     MongoDatabase db = mongoClient.getDatabase(dbName);
 
-    // Drop existing search index
-    try {
-      db.getCollection(collectionName).dropSearchIndex(SEARCH_INDEX_NAME);
-      System.out.printf("Dropped search index: %s%n", SEARCH_INDEX_NAME);
-    } catch (Exception e) {
-      System.out.printf("Search index %s does not exist or already dropped: %s%n",
-          SEARCH_INDEX_NAME, e.getMessage());
-    }
+    dropAllSearchIndexes(db.getCollection(collectionName));
 
     // Drop collection
     try {
@@ -189,6 +188,30 @@ public class Runner {
       System.out.println("Dropped existing collection");
     } catch (Exception e) {
       System.out.printf("Collection does not exist: %s%n", e.getMessage());
+    }
+  }
+
+  private void dropAllSearchIndexes(MongoCollection<Document> collection) {
+    try {
+      List<String> indexNames = new ArrayList<>();
+      for (Document index : collection.listSearchIndexes()) {
+        String name = index.getString("name");
+        if (name != null && !name.isBlank()) {
+          indexNames.add(name);
+        }
+      }
+
+      if (indexNames.isEmpty()) {
+        System.out.println("No existing search indexes found");
+        return;
+      }
+
+      for (String indexName : indexNames) {
+        collection.dropSearchIndex(indexName);
+        System.out.printf("Dropped search index: %s%n", indexName);
+      }
+    } catch (Exception e) {
+      System.out.printf("Could not list or drop search indexes: %s%n", e.getMessage());
     }
   }
 
@@ -283,43 +306,39 @@ public class Runner {
   }
 
   private void performBulkUpdate() {
-    try {
-      MongoDatabase db = mongoClient.getDatabase(dbName);
-      long totalDocs = totalInserted.sum();
-      System.out.printf("Starting bulk update of %,d documents...%n", totalDocs);
-      System.out.println("(This may take several minutes with Atlas Search index enabled)");
+    MongoDatabase db = mongoClient.getDatabase(dbName);
+    long totalDocs = totalInserted.sum();
+    System.out.printf("Starting bulk update of %,d documents...%n", totalDocs);
+    System.out.println("(This may take several minutes with Atlas Search index enabled)");
 
-      long startTime = System.currentTimeMillis();
+    long startTime = System.currentTimeMillis();
 
-      // Add another large field so the update phase measures index maintenance on document growth.
-      Document updateDoc = new Document("$set",
-          new Document("value2", "bar".repeat(PAYLOAD_REPEAT_COUNT))
-              .append("lastUpdated", new java.util.Date())
-      );
+    // Add another large field so the update phase measures index maintenance on document growth.
+    Document updateDoc = new Document("$set",
+        new Document("value2", "bar".repeat(PAYLOAD_REPEAT_COUNT))
+            .append("lastUpdated", new java.util.Date())
+    );
 
-      // Start a progress monitor thread
-      Thread progressMonitor = new Thread(() -> {
-        try {
-          while (!Thread.currentThread().isInterrupted()) {
-            Thread.sleep(5000); // Print every 5 seconds
-            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-            System.out.printf("Update in progress... (%d seconds elapsed)%n", elapsed);
-          }
-        } catch (InterruptedException e) {
-          // Expected when update completes
+    Thread progressMonitor = new Thread(() -> {
+      try {
+        while (!Thread.currentThread().isInterrupted()) {
+          Thread.sleep(5000); // Print every 5 seconds
+          long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+          System.out.printf("Update in progress... (%d seconds elapsed)%n", elapsed);
         }
-      });
-      progressMonitor.setDaemon(true);
-      progressMonitor.start();
+      } catch (InterruptedException e) {
+        // Expected when update completes
+      }
+    });
+    progressMonitor.setDaemon(true);
+    progressMonitor.start();
 
+    try {
       // Update all documents in the collection
       var result = db.getCollection(collectionName).updateMany(
           new Document(), // Empty filter = all documents
           updateDoc
       );
-
-      // Stop progress monitor
-      progressMonitor.interrupt();
 
       long endTime = System.currentTimeMillis();
       double durationSeconds = (endTime - startTime) / 1000.0;
@@ -330,11 +349,8 @@ public class Runner {
       System.out.printf(
           "Bulk update completed: %,d matched, %,d modified in %.1f seconds (%.0f docs/sec)%n",
           result.getMatchedCount(), result.getModifiedCount(), durationSeconds, throughput);
-
-    } catch (Exception e) {
-      totalErrors.add(1);
-      System.err.println("Error during bulk update: " + e.getMessage());
-      e.printStackTrace();
+    } finally {
+      progressMonitor.interrupt();
     }
   }
 

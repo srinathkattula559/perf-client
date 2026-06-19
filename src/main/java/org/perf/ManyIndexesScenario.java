@@ -78,7 +78,7 @@ public class ManyIndexesScenario {
         .applyConnectionString(parsedConnectionString)
         .applyToSocketSettings(builder -> builder
             .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS))
+            .readTimeout(0, TimeUnit.MILLISECONDS))
         .applyToConnectionPoolSettings(builder -> builder
             .maxSize(Math.max(100, threads * 2)))
         .build();
@@ -132,6 +132,7 @@ public class ManyIndexesScenario {
       setupTasks.add(setupPool.submit(() -> {
         String collName = BASE_COLL_NAME + indexId;
         ensureCollection(collName);
+        dropAllSearchIndexes(collName);
         db.getCollection(collName).createIndex(Indexes.compoundIndex(
             Indexes.ascending("status"),
             Indexes.ascending("batchId")));
@@ -253,14 +254,23 @@ public class ManyIndexesScenario {
 
   private void ensureSearchIndex(String collName) {
     MongoCollection<Document> collection = db.getCollection(collName);
+    Document definition = new Document("mappings", new Document("dynamic", true));
+    collection.createSearchIndex(SEARCH_INDEX_NAME, definition);
+  }
+
+  private void dropAllSearchIndexes(String collName) {
+    MongoCollection<Document> collection = db.getCollection(collName);
+    List<String> indexNames = new ArrayList<>();
     for (Document index : collection.listSearchIndexes()) {
-      if (SEARCH_INDEX_NAME.equals(index.getString("name"))) {
-        return;
+      String name = index.getString("name");
+      if (name != null && !name.isBlank()) {
+        indexNames.add(name);
       }
     }
 
-    Document definition = new Document("mappings", new Document("dynamic", true));
-    collection.createSearchIndex(SEARCH_INDEX_NAME, definition);
+    for (String indexName : indexNames) {
+      collection.dropSearchIndex(indexName);
+    }
   }
 
   private void waitForSearchIndexesReady() {
