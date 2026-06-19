@@ -1,3 +1,5 @@
 org/perf/Runner.class
 org/perf/Main.class
+org/perf/ManyIndexesScenario.class
 org/perf/Runner$DocPrep.class
+org/perf/Main$RunnerConfig.class

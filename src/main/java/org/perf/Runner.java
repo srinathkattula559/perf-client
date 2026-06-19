@@ -4,7 +4,9 @@ import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.InsertManyOptions;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -12,6 +14,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -27,6 +30,9 @@ public class Runner {
 
   private static final String DEFAULT_DB_NAME = "db1";
   private static final String SEARCH_INDEX_NAME = "default";
+  private static final Duration INDEX_READY_TIMEOUT = Duration.ofMinutes(10);
+  private static final Duration INDEX_POLL_INTERVAL = Duration.ofSeconds(10);
+  private static final int PAYLOAD_REPEAT_COUNT = 10_240; // ~30 KB for "foo".repeat(...)
 
   // Configuration
   private final String connectionString;
@@ -63,6 +69,14 @@ public class Runner {
       boolean useStringIds,
       boolean enableUpdatePhase) {
 
+    validateConfig(
+        connectionString,
+        threadsCount,
+        durationMinutes,
+        batchWaitMillis,
+        docsPerIteration,
+        collectionName);
+
     this.connectionString = connectionString;
     this.threadsCount = threadsCount;
     this.durationMinutes = durationMinutes;
@@ -80,6 +94,11 @@ public class Runner {
   public void start() {
     MongoClientSettings settings = MongoClientSettings.builder()
         .applyConnectionString(new ConnectionString(this.connectionString))
+        .applyToSocketSettings(builder -> builder
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS))
+        .applyToConnectionPoolSettings(builder -> builder
+            .maxSize(Math.max(100, threadsCount * 2)))
         .build();
 
     this.mongoClient = MongoClients.create(settings);
@@ -91,26 +110,32 @@ public class Runner {
 
     System.out.printf("Client connected to DB '%s'.%n", dbName);
 
-    // Step 1: Cleanup existing search indexes and collection
-    cleanupBeforeTest();
+    try {
+      // Step 1: Cleanup existing search indexes and collection
+      cleanupBeforeTest();
 
-    // Step 2: Create collection and Atlas Search index
-    createSearchIndex();
+      // Step 2: Create collection and Atlas Search index
+      createSearchIndex();
 
-    // Step 3: Wait for index to be ready
-    waitForIndexReady();
+      // Step 3: Wait for index to be ready
+      waitForIndexReady();
 
-    // Phase 1: Insert phase
-    System.out.println("\n=== Phase 1: INSERT ===");
-    System.out.printf("Spawning %d threads...%n", threadsCount);
-    this.insertStartTime = Instant.now();
-    this.insertEndTime = insertStartTime.plus(Duration.ofMinutes(durationMinutes));
+      // Phase 1: Insert phase
+      System.out.println("\n=== Phase 1: INSERT ===");
+      System.out.printf("Spawning %d threads...%n", threadsCount);
+      this.insertStartTime = Instant.now();
+      this.insertEndTime = insertStartTime.plus(Duration.ofMinutes(durationMinutes));
 
-    for (int i = 0; i < this.threadsCount; i++) {
-      final int workerId = i;
-      threads[i] = new Thread(() -> doInsertWork(workerId, insertEndTime));
-      threads[i].setName("Insert-Worker-" + i);
-      threads[i].start();
+      for (int i = 0; i < this.threadsCount; i++) {
+        final int workerId = i;
+        threads[i] = new Thread(() -> doInsertWork(workerId, insertEndTime));
+        threads[i].setName("Insert-Worker-" + i);
+        threads[i].start();
+      }
+    } catch (RuntimeException e) {
+      cleanupAfterTest();
+      shutdown();
+      throw e;
     }
   }
 
@@ -121,7 +146,6 @@ public class Runner {
         if (thread != null) thread.join();
       }
 
-      Instant insertPhaseEnd = Instant.now();
       printInsertPhaseSummary();
 
       // Phase 2: Update phase (if enabled)
@@ -141,7 +165,7 @@ public class Runner {
       System.err.println("Interrupted during join");
     } finally {
       printFinalSummary();
-      // cleanupAfterTest();
+      cleanupAfterTest();
       shutdown();
     }
   }
@@ -173,8 +197,12 @@ public class Runner {
     MongoDatabase db = mongoClient.getDatabase(dbName);
 
     // Create collection
-    db.createCollection(collectionName);
-    System.out.printf("Created collection: %s%n", collectionName);
+    try {
+      db.createCollection(collectionName);
+      System.out.printf("Created collection: %s%n", collectionName);
+    } catch (Exception e) {
+      throw new IllegalStateException("Failed to create collection " + collectionName, e);
+    }
 
     // Create search index with dynamic mapping
     Document indexDefinition = new Document("mappings", new Document("dynamic", true));
@@ -183,20 +211,42 @@ public class Runner {
       db.getCollection(collectionName).createSearchIndex(SEARCH_INDEX_NAME, indexDefinition);
       System.out.printf("Created Atlas Search index: %s%n", SEARCH_INDEX_NAME);
     } catch (Exception e) {
-      System.err.println("Error creating search index: " + e.getMessage());
-      System.err.println("Note: Atlas Search indexes are only available on MongoDB Atlas clusters");
+      throw new IllegalStateException(
+          "Failed to create Atlas Search index. Atlas Search indexes require MongoDB Atlas.", e);
     }
   }
 
   private void waitForIndexReady() {
-    System.out.println("Waiting for index to be ready...");
-    try {
-      Thread.sleep(60000); // Wait 60 seconds for index to be created
-      System.out.println("Index wait complete (60 seconds)");
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      System.err.println("Interrupted while waiting for index");
+    System.out.println("Waiting for search index to be ready...");
+    MongoCollection<Document> collection = mongoClient.getDatabase(dbName).getCollection(collectionName);
+    Instant deadline = Instant.now().plus(INDEX_READY_TIMEOUT);
+
+    while (Instant.now().isBefore(deadline)) {
+      for (Document index : collection.listSearchIndexes()) {
+        if (!SEARCH_INDEX_NAME.equals(index.getString("name"))) {
+          continue;
+        }
+
+        String status = index.getString("status");
+        Object queryable = index.get("queryable");
+        if ("READY".equalsIgnoreCase(status) || Boolean.TRUE.equals(queryable)) {
+          System.out.printf("Search index %s is ready.%n", SEARCH_INDEX_NAME);
+          return;
+        }
+
+        System.out.printf("Search index status: %s%n", status);
+      }
+
+      try {
+        Thread.sleep(INDEX_POLL_INTERVAL.toMillis());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException("Interrupted while waiting for search index readiness", e);
+      }
     }
+
+    throw new IllegalStateException(
+        "Timed out waiting for search index " + SEARCH_INDEX_NAME + " to become ready");
   }
 
   private void cleanupAfterTest() {
@@ -241,19 +291,17 @@ public class Runner {
 
       long startTime = System.currentTimeMillis();
 
-      // Create update document with 2 KB document
+      // Add another large field so the update phase measures index maintenance on document growth.
       Document updateDoc = new Document("$set",
-          new Document("value2", "bar".repeat(682))
+          new Document("value2", "bar".repeat(PAYLOAD_REPEAT_COUNT))
               .append("lastUpdated", new java.util.Date())
       );
 
       // Start a progress monitor thread
       Thread progressMonitor = new Thread(() -> {
         try {
-          int dots = 0;
           while (!Thread.currentThread().isInterrupted()) {
             Thread.sleep(5000); // Print every 5 seconds
-            dots++;
             long elapsed = (System.currentTimeMillis() - startTime) / 1000;
             System.out.printf("Update in progress... (%d seconds elapsed)%n", elapsed);
           }
@@ -278,8 +326,10 @@ public class Runner {
 
       totalUpdated.add(result.getModifiedCount());
 
-      System.out.printf("Bulk update completed: %,d documents updated in %.1f seconds (%.0f docs/sec)%n",
-          result.getModifiedCount(), durationSeconds, result.getModifiedCount() / durationSeconds);
+      double throughput = durationSeconds > 0 ? result.getModifiedCount() / durationSeconds : 0;
+      System.out.printf(
+          "Bulk update completed: %,d matched, %,d modified in %.1f seconds (%.0f docs/sec)%n",
+          result.getMatchedCount(), result.getModifiedCount(), durationSeconds, throughput);
 
     } catch (Exception e) {
       totalErrors.add(1);
@@ -335,7 +385,6 @@ public class Runner {
     }
 
     long lastReportTime = System.currentTimeMillis();
-    long docsInsertedSinceLastReport = 0;
 
     while (Instant.now().isBefore(endTime)) {
       try {
@@ -346,9 +395,8 @@ public class Runner {
         CompletableFuture<Void> nextBatch = prep.refill(backgroundGenPool);
 
         // Insert (The actual work)
-        db.getCollection(collectionName).insertMany(batch);
+        db.getCollection(collectionName).insertMany(batch, new InsertManyOptions().ordered(false));
         totalInserted.add(batch.size());
-        docsInsertedSinceLastReport += batch.size();
 
         // Progress reporting every 10 seconds (only from worker 0 to avoid spam)
         if (workerId == 0) {
@@ -357,7 +405,6 @@ public class Runner {
             long totalDocs = totalInserted.sum();
             System.out.printf("Insert progress: %,d docs inserted%n", totalDocs);
             lastReportTime = currentTime;
-            docsInsertedSinceLastReport = 0;
           }
         }
 
@@ -368,13 +415,21 @@ public class Runner {
           Thread.sleep(batchWaitMillis);
         }
 
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
       } catch (Exception e) {
         totalErrors.add(1);
         // Log error but keep thread alive!
         System.err.printf("[Insert-Worker-%d] Error: %s%n", workerId, e.getMessage());
 
         // Optional: Short sleep on error to avoid hammering if DB is down
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        try {
+          Thread.sleep(1000);
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          break;
+        }
       }
     }
   }
@@ -392,8 +447,7 @@ public class Runner {
       this.docsPerIteration = docsPerIteration;
       this.useStringIds = useStringIds;
       this.workerId = workerId;
-      // Generate 2 KB documents.
-      this.payloads = generatePayloads(100, 682);
+      this.payloads = generatePayloads(100, PAYLOAD_REPEAT_COUNT);
       this.docs = new ArrayList<>();
     }
 
@@ -419,10 +473,8 @@ public class Runner {
 
     private BsonValue generateId() {
       if (useStringIds) {
-        // FIXED: Include workerId to guarantee uniqueness across threads
-        // Format: randomString - workerId - sequence
         return new BsonString(
-            RandomStringUtils.randomAlphanumeric(9) + "-" + workerId + "-" + (sequenceNumber % 10000)
+            workerId + "-" + sequenceNumber + "-" + RandomStringUtils.randomAlphanumeric(12)
         );
       }
       return new BsonObjectId(new ObjectId());
@@ -438,6 +490,33 @@ public class Runner {
         batch.add(doc);
       }
       return batch;
+    }
+  }
+
+  private static void validateConfig(
+      String connectionString,
+      int threadsCount,
+      int durationMinutes,
+      long batchWaitMillis,
+      int docsPerIteration,
+      String collectionName) {
+    if (connectionString == null || connectionString.isBlank()) {
+      throw new IllegalArgumentException("connectionString must not be blank");
+    }
+    if (threadsCount <= 0) {
+      throw new IllegalArgumentException("threadsCount must be > 0");
+    }
+    if (durationMinutes <= 0) {
+      throw new IllegalArgumentException("durationMinutes must be > 0");
+    }
+    if (batchWaitMillis < 0) {
+      throw new IllegalArgumentException("batchWaitMillis must be >= 0");
+    }
+    if (docsPerIteration <= 0) {
+      throw new IllegalArgumentException("docsPerIteration must be > 0");
+    }
+    if (collectionName == null || collectionName.isBlank()) {
+      throw new IllegalArgumentException("collectionName must not be blank");
     }
   }
 }

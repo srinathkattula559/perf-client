@@ -4,8 +4,11 @@ import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.Indexes;
+import com.mongodb.client.model.InsertManyOptions;
 import com.mongodb.client.model.Updates;
 import java.time.Duration;
 import java.time.Instant;
@@ -13,30 +16,35 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.bson.Document;
+import org.bson.types.ObjectId;
 
 public class ManyIndexesScenario {
 
-  // --- CONFIGURATION ---
-  // Scaled to 1000 to make the "Idle vs Active" contrast obvious
-  private static final int TOTAL_COLLECTIONS = 1000;
-  private static final int NUM_ACTIVE_COLLECTIONS = 2;
+  private static final int DEFAULT_TOTAL_COLLECTIONS = 100;
+  private static final int DEFAULT_NUM_ACTIVE_COLLECTIONS = 2;
+  private static final int DEFAULT_DURATION_MINUTES = 10;
+  private static final int DEFAULT_THREADS = 10;
+  private static final int DEFAULT_DOCS_PER_BATCH = 5_000;
   private static final String BASE_COLL_NAME = "scale_test_";
-  private static final String DB_NAME = "scale_db";
+  private static final String DEFAULT_DB_NAME = "scale_db";
   private static final String SEARCH_INDEX_NAME = "default";
-
-  // Test Duration
-  private static final int DURATION_MINUTES = 10;
-  private static final int THREADS = 10;
-  private static final int DOCS_PER_BATCH = 50;
+  private static final Duration INDEX_READY_TIMEOUT = Duration.ofMinutes(20);
+  private static final Duration INDEX_POLL_INTERVAL = Duration.ofSeconds(15);
 
   public static void main(String[] args) {
     if (args.length < 1) {
-      System.out.println("Usage: java -cp target/perf-client-1.0-SNAPSHOT.jar org.perf.ManyIndexesScenario <connection_string>");
+      System.out.println(
+          "Usage: java -cp target/perf-client-1.0-SNAPSHOT.jar "
+              + "org.perf.ManyIndexesScenario <connection_string>");
+      System.out.println(
+          "Optional -D settings: totalCollections, activeCollections, durationMinutes, "
+              + "threads, docsPerBatch");
       System.exit(1);
     }
 
@@ -47,79 +55,108 @@ public class ManyIndexesScenario {
   private final MongoClient client;
   private final MongoDatabase db;
   private final List<String> activeCollectionNames;
+  private final int totalCollections;
+  private final int numActiveCollections;
+  private final int durationMinutes;
+  private final int threads;
+  private final int docsPerBatch;
+  private final boolean cleanupAfterRun;
 
   public ManyIndexesScenario(String connectionString) {
+    this.totalCollections = positiveProperty("totalCollections", DEFAULT_TOTAL_COLLECTIONS);
+    this.numActiveCollections = positiveProperty("activeCollections", DEFAULT_NUM_ACTIVE_COLLECTIONS);
+    this.durationMinutes = positiveProperty("durationMinutes", DEFAULT_DURATION_MINUTES);
+    this.threads = positiveProperty("threads", DEFAULT_THREADS);
+    this.docsPerBatch = positiveProperty("docsPerBatch", DEFAULT_DOCS_PER_BATCH);
+    this.cleanupAfterRun = booleanProperty("cleanupAfterRun", true);
+    if (numActiveCollections > totalCollections) {
+      throw new IllegalArgumentException("activeCollections must be <= totalCollections");
+    }
+
+    ConnectionString parsedConnectionString = new ConnectionString(connectionString);
     MongoClientSettings settings = MongoClientSettings.builder()
-        .applyConnectionString(new ConnectionString(connectionString))
+        .applyConnectionString(parsedConnectionString)
         .applyToSocketSettings(builder -> builder
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS))
+        .applyToConnectionPoolSettings(builder -> builder
+            .maxSize(Math.max(100, threads * 2)))
         .build();
 
     this.client = MongoClients.create(settings);
-    this.db = client.getDatabase(DB_NAME);
+    this.db = client.getDatabase(
+        parsedConnectionString.getDatabase() != null
+            ? parsedConnectionString.getDatabase()
+            : DEFAULT_DB_NAME);
 
     this.activeCollectionNames = new ArrayList<>();
     // Pick active collections evenly spaced out
-    int step = TOTAL_COLLECTIONS / NUM_ACTIVE_COLLECTIONS;
-    for (int i = 0; i < NUM_ACTIVE_COLLECTIONS; i++) {
+    int step = Math.max(1, totalCollections / numActiveCollections);
+    for (int i = 0; i < numActiveCollections; i++) {
       this.activeCollectionNames.add(BASE_COLL_NAME + (i * step));
     }
   }
 
   public void run() {
     System.out.println("=== Starting Basic Scale Test (No Oplog Desert) ===");
-    System.out.printf("Total Indexes: %d | Active Collection Count: %d%n", TOTAL_COLLECTIONS, NUM_ACTIVE_COLLECTIONS);
+    System.out.printf(
+        "Database: %s | Total Indexes: %d | Active Collection Count: %d%n",
+        db.getName(), totalCollections, numActiveCollections);
     System.out.println("Active Collections List: " + activeCollectionNames);
 
-    // 1. Setup Phase
-    setupEnvironment();
+    try {
+      // 1. Setup Phase
+      setupEnvironment();
 
-    // 2. Cooldown
-    System.out.println("\nWaiting 60 seconds for indexes to stabilize...");
-    sleep(60);
+      // 2. Wait until search indexes are queryable
+      waitForSearchIndexesReady();
 
-    // 3. Execution Phase
-    runWorkload();
-
-    client.close();
+      // 3. Execution Phase
+      runWorkload();
+    } finally {
+      if (cleanupAfterRun) {
+        cleanupEnvironment();
+      }
+      client.close();
+    }
   }
 
   private void setupEnvironment() {
-    System.out.println("\n>>> Setting up " + TOTAL_COLLECTIONS + " collections...");
+    System.out.println("\n>>> Setting up " + totalCollections + " collections...");
     ExecutorService setupPool = Executors.newFixedThreadPool(50);
+    List<Future<?>> setupTasks = new ArrayList<>();
     long start = System.currentTimeMillis();
 
-    for (int i = 0; i < TOTAL_COLLECTIONS; i++) {
+    for (int i = 0; i < totalCollections; i++) {
       final int indexId = i;
-      setupPool.submit(() -> {
+      setupTasks.add(setupPool.submit(() -> {
         String collName = BASE_COLL_NAME + indexId;
-        try {
-          // Create Collection (ignore if exists)
-          try { db.createCollection(collName); } catch (Exception ignored) {}
+        ensureCollection(collName);
+        db.getCollection(collName).createIndex(Indexes.compoundIndex(
+            Indexes.ascending("status"),
+            Indexes.ascending("batchId")));
+        ensureSearchIndex(collName);
 
-          // Create Search Index
-          Document definition = new Document("mappings", new Document("dynamic", true));
-          try {
-            db.getCollection(collName).createSearchIndex(SEARCH_INDEX_NAME, definition);
-          } catch (Exception ignored) {}
-
-          if (indexId % 200 == 0) {
-            System.out.printf("Setup progress: %d/%d...%n", indexId, TOTAL_COLLECTIONS);
-          }
-        } catch (Exception e) {
-          System.err.printf("Failed to setup %s: %s%n", collName, e.getMessage());
+        if (indexId % 20 == 0) {
+          System.out.printf("Setup progress: %d/%d...%n", indexId, totalCollections);
         }
-      });
+      }));
     }
 
     setupPool.shutdown();
     try {
       if (!setupPool.awaitTermination(45, TimeUnit.MINUTES)) {
-        System.err.println("Setup timed out! proceeding anyway...");
+        setupPool.shutdownNow();
+        throw new IllegalStateException("Setup timed out");
+      }
+      for (Future<?> task : setupTasks) {
+        task.get();
       }
     } catch (InterruptedException e) {
-      throw new RuntimeException(e);
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Interrupted while setting up collections", e);
+    } catch (Exception e) {
+      throw new IllegalStateException("Failed to set up collections and indexes", e);
     }
 
     long duration = (System.currentTimeMillis() - start) / 1000;
@@ -129,11 +166,11 @@ public class ManyIndexesScenario {
   private void runWorkload() {
     System.out.println("\n>>> Starting Workload (Targeted Updates Only)...");
 
-    ExecutorService workers = Executors.newFixedThreadPool(THREADS);
+    ExecutorService workers = Executors.newFixedThreadPool(threads);
     AtomicLong totalOps = new AtomicLong(0);
-    Instant end = Instant.now().plus(Duration.ofMinutes(DURATION_MINUTES));
+    Instant end = Instant.now().plus(Duration.ofMinutes(durationMinutes));
 
-    for (int t = 0; t < THREADS; t++) {
+    for (int t = 0; t < threads; t++) {
       workers.submit(() -> {
         while (Instant.now().isBefore(end)) {
           try {
@@ -143,25 +180,28 @@ public class ManyIndexesScenario {
             );
 
             // 1. Insert Batch (Status: new)
-            List<Document> batch = new ArrayList<>(DOCS_PER_BATCH);
-            for (int i = 0; i < DOCS_PER_BATCH; i++) {
+            String batchId = new ObjectId().toHexString();
+            List<Document> batch = new ArrayList<>(docsPerBatch);
+            for (int i = 0; i < docsPerBatch; i++) {
               batch.add(new Document("text", RandomStringUtils.randomAlphanumeric(50))
                   .append("ts", System.currentTimeMillis())
+                  .append("batchId", batchId)
                   .append("status", "new"));
             }
-            db.getCollection(targetCollName).insertMany(batch);
+            db.getCollection(targetCollName).insertMany(batch, new InsertManyOptions().ordered(false));
 
-            // 2. TARGETED Update (No Desert)
-            // Only update the documents we just inserted (status="new")
-            // This keeps the oplog footprint small and proportional to the insert rate.
-            db.getCollection(targetCollName).updateMany(
-                Filters.eq("status", "new"),
+            // 2. TARGETED Update (No Desert). Batch ID isolates concurrent workers.
+            var updateResult = db.getCollection(targetCollName).updateMany(
+                Filters.and(Filters.eq("status", "new"), Filters.eq("batchId", batchId)),
                 Updates.set("status", "processed")
             );
 
-            totalOps.addAndGet(DOCS_PER_BATCH * 2L);
+            totalOps.addAndGet(docsPerBatch + updateResult.getModifiedCount());
 
             Thread.sleep(50);
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            break;
           } catch (Exception e) {
             System.err.println("Error in worker: " + e.getMessage());
           }
@@ -182,11 +222,115 @@ public class ManyIndexesScenario {
         lastCount = current;
       }
     } catch (InterruptedException e) {
-      e.printStackTrace();
+      Thread.currentThread().interrupt();
+      workers.shutdownNow();
+      throw new IllegalStateException("Interrupted while running workload", e);
+    } finally {
+      workers.shutdownNow();
     }
   }
 
-  private void sleep(int seconds) {
-    try { Thread.sleep(seconds * 1000L); } catch (InterruptedException e) {}
+  private void cleanupEnvironment() {
+    System.out.println("\n>>> Cleaning up scale test collections...");
+    for (int i = 0; i < totalCollections; i++) {
+      String collName = BASE_COLL_NAME + i;
+      try {
+        db.getCollection(collName).drop();
+      } catch (Exception e) {
+        System.err.printf("Failed to drop %s: %s%n", collName, e.getMessage());
+      }
+    }
+  }
+
+  private void ensureCollection(String collName) {
+    for (String existingName : db.listCollectionNames()) {
+      if (collName.equals(existingName)) {
+        return;
+      }
+    }
+    db.createCollection(collName);
+  }
+
+  private void ensureSearchIndex(String collName) {
+    MongoCollection<Document> collection = db.getCollection(collName);
+    for (Document index : collection.listSearchIndexes()) {
+      if (SEARCH_INDEX_NAME.equals(index.getString("name"))) {
+        return;
+      }
+    }
+
+    Document definition = new Document("mappings", new Document("dynamic", true));
+    collection.createSearchIndex(SEARCH_INDEX_NAME, definition);
+  }
+
+  private void waitForSearchIndexesReady() {
+    System.out.println("\nWaiting for search indexes to become ready...");
+    Instant deadline = Instant.now().plus(INDEX_READY_TIMEOUT);
+
+    while (Instant.now().isBefore(deadline)) {
+      int readyCount = 0;
+      for (int i = 0; i < totalCollections; i++) {
+        if (isSearchIndexReady(BASE_COLL_NAME + i)) {
+          readyCount++;
+        }
+      }
+
+      System.out.printf("Search index readiness: %d/%d%n", readyCount, totalCollections);
+      if (readyCount == totalCollections) {
+        return;
+      }
+
+      try {
+        Thread.sleep(INDEX_POLL_INTERVAL.toMillis());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException("Interrupted while waiting for search indexes", e);
+      }
+    }
+
+    throw new IllegalStateException("Timed out waiting for search indexes to become ready");
+  }
+
+  private boolean isSearchIndexReady(String collName) {
+    MongoCollection<Document> collection = db.getCollection(collName);
+    for (Document index : collection.listSearchIndexes()) {
+      if (!SEARCH_INDEX_NAME.equals(index.getString("name"))) {
+        continue;
+      }
+      String status = index.getString("status");
+      Object queryable = index.get("queryable");
+      return "READY".equalsIgnoreCase(status) || Boolean.TRUE.equals(queryable);
+    }
+    return false;
+  }
+
+  private static int positiveProperty(String name, int defaultValue) {
+    String value = System.getProperty(name);
+    if (value == null || value.isBlank()) {
+      return defaultValue;
+    }
+    try {
+      int parsed = Integer.parseInt(value);
+      if (parsed <= 0) {
+        throw new IllegalArgumentException(name + " must be > 0");
+      }
+      return parsed;
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException(name + " must be an integer", e);
+    }
+  }
+
+  private static boolean booleanProperty(String name, boolean defaultValue) {
+    String value = System.getProperty(name);
+    if (value == null || value.isBlank()) {
+      return defaultValue;
+    }
+    if ("true".equalsIgnoreCase(value)) {
+      return true;
+    }
+    if ("false".equalsIgnoreCase(value)) {
+      return false;
+    }
+    throw new IllegalArgumentException(name + " must be true or false");
   }
 }

@@ -1,0 +1,10 @@
+target/
+.m2/
+dependency-reduced-pom.xml
+maven-wrapper.tar.gz
+
+.idea/
+.vscode/
+*.iml
+
+.DS_Store
